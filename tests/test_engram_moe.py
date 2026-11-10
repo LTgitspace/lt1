@@ -31,6 +31,7 @@ class TestEngramMoE(unittest.TestCase):
         bias_before = moe.expert_bias.clone()
         out = moe(x)
         out.sum().backward()
+        moe.step_bias()
         self.assertFalse(torch.equal(moe.expert_bias, bias_before))
         self.assertIsNotNone(moe.router.weight.grad)
 

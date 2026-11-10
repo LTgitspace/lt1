@@ -13,6 +13,7 @@ dist/
 *.bin
 *.safetensors
 checkpoints/
+checkpoints_1b/
 data/cache/
 *.log
 

@@ -27,6 +27,9 @@ class LT1Config:
     use_bitlinear: bool = False
     rope_theta: float = 10000.0
     rms_norm_eps: float = 1e-6
+    engram_offload_cpu: bool = False
+    use_grad_checkpointing: bool = False
+    use_bf16_weights: bool = False
 
     def __post_init__(self):
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
@@ -63,3 +66,40 @@ def tiny_smoke_config() -> LT1Config:
         ncm_codebook_size=64,
         ncm_scales=(4, 2, 1),
     )
+
+
+def lt1_1b_config(vocab_size: int = 8192) -> LT1Config:
+    """
+    Returns balanced 1.00 Billion parameter LT-1 configuration:
+    - 529.7M GPU MoE + CED Backbone (d_model=896, 10 physical layers, 1 Shared + 16 Routed experts)
+    - 469.8M Host-DRAM Factored Engram (2 tables x 1,048,576 buckets x 224 dim)
+    - Total: 999,450,000 (~1.00B) parameters.
+    - Fits comfortably inside 3.50 GB GPU VRAM (RTX 3060 6GB) and 0.95 GB System RAM (16GB RAM).
+    """
+    return LT1Config(
+        vocab_size=vocab_size,
+        max_seq_len=256,
+        d_model=896,
+        n_encoder_layers=4,
+        n_recurrent_layers=4,
+        n_coda_layers=2,
+        max_loops=4,
+        default_loops=2,
+        n_heads=14,
+        n_kv_heads=2,
+        head_dim=64,
+        moe_n_routed_experts=16,
+        moe_n_shared_experts=1,
+        moe_top_k_encoder=1,
+        moe_top_k_decoder=2,
+        moe_d_ff=1088,
+        moe_bias_lr=0.001,
+        engram_buckets=1048576,
+        engram_dim=224,
+        ncm_codebook_size=512,
+        ncm_scales=(4, 2, 1),
+        engram_offload_cpu=True,
+        use_grad_checkpointing=True,
+        use_bf16_weights=True,
+    )
+

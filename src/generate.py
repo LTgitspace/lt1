@@ -95,19 +95,27 @@ def main():
     tok = NanoTokenizer.load(args.tokenizer)
 
     if os.path.exists(args.checkpoint):
-        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
         cfg = ckpt.get("config", base_config())
         cfg.vocab_size = tok.vocab_size
-        model = LT1Model(cfg).to(device)
-        model.load_state_dict(ckpt["model_state_dict"])
+        model = LT1Model(cfg)
+        if ckpt.get("is_exported_inference", False):
+            model.pack_for_inference(device=device)
+            model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        else:
+            model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            model.pack_for_inference(device=device)
+
         step_num = ckpt.get("step", "unknown")
         step_loss = ckpt.get("step_loss", 0.0)
-        print(f"[Loaded] {args.checkpoint} (Step {step_num}, Loss {step_loss:.4f}) on {device}")
+        print(f"[Loaded] {args.checkpoint} (Step {step_num}, Loss {step_loss:.4f}) on {device} (Zero-Sync Inference Active)")
     else:
         cfg = base_config()
         cfg.vocab_size = tok.vocab_size
-        model = LT1Model(cfg).to(device)
+        model = LT1Model(cfg)
+        model.pack_for_inference(device=device)
         print(f"[Warning] Checkpoint {args.checkpoint} not found, using random weights.")
+
 
     if args.interactive:
         loops = args.loops

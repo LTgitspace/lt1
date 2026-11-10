@@ -108,12 +108,15 @@ class TriOptimizer:
         adamw_params = []
 
         # Identify sparse engram table IDs
-        sparse_ids = {
-            id(model.engram_1.table.weight),
-            id(model.engram_2.table.weight),
-        }
+        sparse_ids = set()
+        if not model.cfg.engram_offload_cpu:
+            if hasattr(model.engram_1, "table") and model.engram_1.table is not None:
+                sparse_ids.add(id(model.engram_1.table.weight))
+            if hasattr(model.engram_2, "table") and model.engram_2.table is not None:
+                sparse_ids.add(id(model.engram_2.table.weight))
 
         # Excluded from Muon (must use AdamW)
+
         excluded_from_muon = {
             id(model.tok_emb.weight),
             id(model.loop_inj_gates),
@@ -154,12 +157,21 @@ class TriOptimizer:
 
         if self.sparse_adam:
             self.sparse_adam.step()
+        elif getattr(self.model.cfg, "engram_offload_cpu", False):
+            sparse_lr = self.base_lrs["sparse"] * getattr(self, "_lr_scale", 1.0)
+            self.model.engram_1.step_sparse_rms(sparse_lr)
+            self.model.engram_2.step_sparse_rms(sparse_lr)
+
         if self.muon:
             self.muon.step()
         if self.adamw:
             self.adamw.step()
 
+        if hasattr(self.model, "step_moe_biases"):
+            self.model.step_moe_biases()
+
     def set_lr_scale(self, scale: float):
+        self._lr_scale = scale
         if self.muon:
             for g in self.muon.param_groups:
                 g["lr"] = self.base_lrs["muon"] * scale
@@ -169,3 +181,4 @@ class TriOptimizer:
         if self.sparse_adam:
             for g in self.sparse_adam.param_groups:
                 g["lr"] = self.base_lrs["sparse"] * scale
+

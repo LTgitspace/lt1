@@ -8,27 +8,35 @@ cls
 echo ======================================================
 echo                LT-1 Control Panel
 echo ======================================================
-echo [1] Monitor Live Training Logs (train.log)
+echo [1] Monitor Live Training Logs (train_1b.log / train.log)
 echo [2] Monitor GPU VRAM and Temperature (nvidia-smi)
-echo [3] Generate Text from Latest Checkpoint
+echo [3] Generate Text / Chat from Checkpoint
 echo [4] Run Unit Test Suite
-echo [5] Start New Base Pre-Training
-echo [6] Run Smoke Pre-Training (50 steps)
+echo [5] Start 1.00B Pre-Training + Auto-SFT (train_1b.bat)
+echo [6] Start 62.6M Base Pre-Training (train.bat)
+echo [7] Export Checkpoint for Accelerated Inference (export.bat)
+echo [8] Run Smoke Pre-Training (50 steps)
 echo [0] Exit
 echo ======================================================
-set /p CHOICE="Select an option [0-6]: "
+set /p CHOICE="Select an option [0-8]: "
 
 if "%CHOICE%"=="1" goto MONITOR
 if "%CHOICE%"=="2" goto GPU
 if "%CHOICE%"=="3" goto GENERATE
 if "%CHOICE%"=="4" goto TESTS
-if "%CHOICE%"=="5" goto TRAIN
-if "%CHOICE%"=="6" goto SMOKE
+if "%CHOICE%"=="5" goto TRAIN1B
+if "%CHOICE%"=="6" goto TRAIN
+if "%CHOICE%"=="7" goto EXPORT
+if "%CHOICE%"=="8" goto SMOKE
 if "%CHOICE%"=="0" goto EXIT
 goto MENU
 
 :MONITOR
-call monitor.bat
+if exist "train_1b.log" (
+    powershell -Command "Get-Content train_1b.log -Wait -Tail 30"
+) else (
+    call monitor.bat
+)
 goto MENU
 
 :GPU
@@ -53,8 +61,16 @@ echo ======================================================
 pause
 goto MENU
 
+:TRAIN1B
+call train_1b.bat
+goto MENU
+
 :TRAIN
 call train.bat
+goto MENU
+
+:EXPORT
+call export.bat
 goto MENU
 
 :SMOKE

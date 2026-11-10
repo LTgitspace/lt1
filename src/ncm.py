@@ -30,10 +30,35 @@ class EMACodebook(nn.Module):
         self.register_buffer("embedding", embed)
         self.register_buffer("cluster_size", torch.ones(num_codes))
         self.register_buffer("embed_avg", embed.clone())
+        self.is_packed_inference = False
+
+    def pack_for_inference(self, device: torch.device | str = "cuda"):
+        self.is_packed_inference = True
+        self.embedding = nn.Parameter(self.embedding.data.to(device=device, dtype=torch.bfloat16), requires_grad=False)
+        self.register_buffer("e_sq", self.embedding.pow(2).sum(dim=-1, keepdim=True).T, persistent=False)
+        if hasattr(self, "cluster_size"):
+            self.cluster_size = None
+        if hasattr(self, "embed_avg"):
+            self.embed_avg = None
 
     def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         orig_shape = z.shape
         z_flat = z.reshape(-1, self.code_dim).float()
+
+        if getattr(self, "is_packed_inference", False):
+            # Fast zero-sync inference path
+            e_sq = getattr(self, "e_sq", None)
+            if e_sq is None:
+                e_sq = self.embedding.pow(2).sum(dim=-1, keepdim=True).T
+            z_sq = z_flat.pow(2).sum(dim=-1, keepdim=True)
+            dist = z_sq + e_sq - 2.0 * (z_flat @ self.embedding.T.float())
+            indices = torch.argmin(dist, dim=-1)
+            z_q_flat = self.embedding[indices].to(z.dtype)
+            commit_loss = torch.tensor(0.0, device=z.device, dtype=z.dtype)
+            metrics = {"perplexity": 1.0, "active_ratio": 1.0}
+            z_q = z_q_flat.reshape(orig_shape)
+            indices = indices.reshape(orig_shape[:-1])
+            return z_q, indices, commit_loss, metrics
 
         # Compute squared Euclidean distances: ||z - e||^2 = ||z||^2 + ||e||^2 - 2 * z @ e.T
         z_sq = z_flat.pow(2).sum(dim=-1, keepdim=True)
@@ -47,12 +72,13 @@ class EMACodebook(nn.Module):
         # Commitment loss
         commit_loss = self.commitment_weight * F.mse_loss(z_flat, z_q_flat.detach())
 
+
         # EMA codebook update & dead-code restart during training
         if self.training:
             with torch.no_grad():
-                one_hot = F.one_hot(indices, self.num_codes).float()
-                curr_counts = one_hot.sum(dim=0)
-                curr_embed_sum = one_hot.T @ z_flat
+                one_hot = F.one_hot(indices, self.num_codes).to(self.embed_avg.dtype)
+                curr_counts = one_hot.sum(dim=0).to(self.cluster_size.dtype)
+                curr_embed_sum = one_hot.T @ z_flat.to(self.embed_avg.dtype)
 
                 self.cluster_size.mul_(self.decay).add_(curr_counts, alpha=1.0 - self.decay)
                 self.embed_avg.mul_(self.decay).add_(curr_embed_sum, alpha=1.0 - self.decay)
@@ -69,8 +95,8 @@ class EMACodebook(nn.Module):
                     num_dead = dead_mask.sum().item()
                     rand_idx = torch.randint(0, z_flat.shape[0], (num_dead,), device=z.device)
                     replacement = z_flat[rand_idx]
-                    self.embedding[dead_mask] = replacement
-                    self.embed_avg[dead_mask] = replacement
+                    self.embedding[dead_mask] = replacement.to(self.embedding.dtype)
+                    self.embed_avg[dead_mask] = replacement.to(self.embed_avg.dtype)
                     self.cluster_size[dead_mask] = 1.0
 
         # Compute codebook perplexity metrics
@@ -136,6 +162,13 @@ class CausalMultiscaleRVQ(nn.Module):
         ])
         self.w_gate = nn.Linear(cfg.d_model, cfg.d_model)
         self.next_concept_head = nn.Linear(cfg.d_model, cfg.ncm_codebook_size)
+        self.is_packed_inference = False
+
+    def pack_for_inference(self, device: torch.device | str = "cuda"):
+        self.is_packed_inference = True
+        for cb in self.codebooks:
+            cb.pack_for_inference(device)
+        self.w_gate = self.w_gate.to(device=device, dtype=torch.bfloat16)
 
     def forward(
         self,
@@ -171,15 +204,17 @@ class CausalMultiscaleRVQ(nn.Module):
 
         # Auxiliary next-concept prediction loss (predicting coarse concept code at span t + 4)
         next_concept_loss = torch.tensor(0.0, device=h_enc.device, dtype=h_enc.dtype)
-        if first_scale_indices is not None and h_enc.shape[1] > 4:
-            pred_logits = self.next_concept_head(h_enc[:, :-4]) # [B, T - 4, num_codes]
-            targets = first_scale_indices[:, 4:]                 # [B, T - 4]
-            next_concept_loss = F.cross_entropy(
-                pred_logits.reshape(-1, pred_logits.shape[-1]),
-                targets.reshape(-1),
-            )
+        if not getattr(self, "is_packed_inference", False):
+            if first_scale_indices is not None and h_enc.shape[1] > 4:
+                pred_logits = self.next_concept_head(h_enc[:, :-4]) # [B, T - 4, num_codes]
+                targets = first_scale_indices[:, 4:]                 # [B, T - 4]
+                next_concept_loss = F.cross_entropy(
+                    pred_logits.reshape(-1, pred_logits.shape[-1]),
+                    targets.reshape(-1),
+                )
 
         return h_out, total_commit_loss, next_concept_loss, scale_metrics
+
 
 
 class ParallelMultiscaleNCM(nn.Module):

@@ -204,16 +204,90 @@ class LT1Model(nn.Module):
             for _ in range(cfg.n_coda_layers)
         ])
         self.final_norm = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
+        self.is_packed_inference = False
+
+        if cfg.use_bf16_weights:
+            # Cast GPU-resident backbone modules to bfloat16 to cut VRAM by 50%
+            self.tok_emb.bfloat16()
+            self.eng_proj_norm_to_bf16()
+            self.encoder_layers.bfloat16()
+            self.enc_norm.bfloat16()
+            self.ncm_bridge.bfloat16()
+            self.bridge_wk.bfloat16()
+            self.bridge_wv.bfloat16()
+            self.recurrent_layers.bfloat16()
+            self.loop_inj_proj.bfloat16()
+            self.loop_bound_norm.bfloat16()
+            self.coda_layers.bfloat16()
+            self.final_norm.bfloat16()
+
+    def eng_proj_norm_to_bf16(self):
+        for eng in (self.engram_1, self.engram_2):
+            eng.w_proj.bfloat16()
+            eng.w_gate.bfloat16()
+            eng.rms_norm.bfloat16()
+
+    def pack_for_inference(self, device: torch.device | str = "cuda"):
+        self.eval()
+        self.engram_1.pack_for_inference(device)
+        self.engram_2.pack_for_inference(device)
+        self.ncm_bridge.pack_for_inference(device)
+        for layer in list(self.encoder_layers) + list(self.recurrent_layers) + list(self.coda_layers):
+            layer.moe.pack_for_inference(device)
+            layer.to(device=device, dtype=torch.bfloat16)
+        self.to(device=device, dtype=torch.bfloat16)
+        self.is_packed_inference = True
+        return self
 
     def count_parameters(self) -> dict[str, int]:
         total_params = sum(p.numel() for p in self.parameters())
-        sparse_params = self.engram_1.table.weight.numel() + self.engram_2.table.weight.numel()
+        sparse_params = 0
+        for eng in (self.engram_1, self.engram_2):
+            if hasattr(eng, "table_weight") and eng.table_weight is not None:
+                sparse_params += eng.table_weight.numel()
+            elif hasattr(eng, "compact_table") and eng.compact_table is not None:
+                sparse_params += eng.compact_table.numel()
+            elif hasattr(eng, "table") and eng.table is not None:
+                sparse_params += eng.table.weight.numel()
+
+        if self.cfg.engram_offload_cpu and sparse_params > 0:
+            total_params += sparse_params
+
         dense_params = total_params - sparse_params
         return {
             "total": total_params,
             "sparse_engram": sparse_params,
             "dense_backbone": dense_params,
         }
+
+    def get_num_params(self) -> dict[str, int]:
+        counts = self.count_parameters()
+        return {
+            "total": counts["total"],
+            "sparse_engram": counts["sparse_engram"],
+            "dense_backbone": counts["dense_backbone"],
+            "offloaded_cpu": counts["sparse_engram"] if self.cfg.engram_offload_cpu else 0,
+            "on_device": counts["dense_backbone"] if self.cfg.engram_offload_cpu else counts["total"],
+        }
+
+    def get_offloaded_tables(self) -> dict[str, torch.Tensor]:
+        tables = {}
+        for idx, eng in enumerate((self.engram_1, self.engram_2), start=1):
+            if hasattr(eng, "table_weight") and eng.table_weight is not None:
+                tables[f"engram_{idx}"] = eng.table_weight
+        return tables
+
+    def step_moe_biases(self):
+        for m in self.modules():
+            if hasattr(m, "step_bias"):
+                m.step_bias()
+
+    def _run_block(self, layer, x, cos, sin, shared_kv=None, cached_kv=None):
+        if self.training and self.cfg.use_grad_checkpointing and cached_kv is None:
+            import torch.utils.checkpoint as cp
+            return cp.checkpoint(layer, x, cos, sin, shared_kv, cached_kv, use_reentrant=False)
+        return layer(x, cos, sin, shared_kv=shared_kv, cached_kv=cached_kv)
+
 
     def forward(
         self,
@@ -243,7 +317,7 @@ class LT1Model(nn.Module):
         # 2. Stage 1: Causal Encoder Prelude
         for l_idx, enc_layer in enumerate(self.encoder_layers):
             cached = kv_cache.encoder_kv[l_idx] if kv_cache is not None else None
-            x, new_kv = enc_layer(x, cos, sin, cached_kv=cached)
+            x, new_kv = self._run_block(enc_layer, x, cos, sin, cached_kv=cached)
             if kv_cache is not None:
                 kv_cache.encoder_kv[l_idx] = new_kv
 
@@ -285,15 +359,15 @@ class LT1Model(nn.Module):
             curr_x = self.loop_bound_norm(curr_x + alpha_l * self.loop_inj_proj(h_enc))
 
             # Recurrent Layer 0: Reuse global_kv
-            curr_x, _ = self.recurrent_layers[0](curr_x, cos, sin, shared_kv=global_kv)
+            curr_x, _ = self._run_block(self.recurrent_layers[0], curr_x, cos, sin, shared_kv=global_kv)
 
             # Recurrent Layer 1: Reuse global_kv
-            curr_x, _ = self.recurrent_layers[1](curr_x, cos, sin, shared_kv=global_kv)
+            curr_x, _ = self._run_block(self.recurrent_layers[1], curr_x, cos, sin, shared_kv=global_kv)
 
             # Recurrent Layer 2: Refresh Anchor KV (Last-Loop KV caching)
             cached_anchor = kv_cache.anchor_kv if kv_cache is not None else None
-            curr_x, new_anchor_kv = self.recurrent_layers[2](
-                curr_x, cos, sin,
+            curr_x, new_anchor_kv = self._run_block(
+                self.recurrent_layers[2], curr_x, cos, sin,
                 cached_kv=cached_anchor,
             )
             anchor_kv = new_anchor_kv if new_anchor_kv is not None else anchor_kv
@@ -301,12 +375,13 @@ class LT1Model(nn.Module):
                 kv_cache.anchor_kv = new_anchor_kv
 
             # Recurrent Layer 3: Reuse anchor_kv
-            curr_x, _ = self.recurrent_layers[3](curr_x, cos, sin, shared_kv=anchor_kv)
+            curr_x, _ = self._run_block(self.recurrent_layers[3], curr_x, cos, sin, shared_kv=anchor_kv)
 
         # 6. Stage 3: Output Coda Block
         coda_x = curr_x
         for coda_layer in self.coda_layers:
-            coda_x, _ = coda_layer(coda_x, cos, sin, shared_kv=anchor_kv)
+            coda_x, _ = self._run_block(coda_layer, coda_x, cos, sin, shared_kv=anchor_kv)
+
 
         # 7. Final Norm & Tied LM Head
         coda_normed = self.final_norm(coda_x)
