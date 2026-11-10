@@ -70,6 +70,7 @@ def encode_sft_turn(
 
 def prepare_dataset(
     dataset_name: str = "roneneldan/TinyStories",
+    subset: str | None = None,
     split: str = "train",
     output_bin: str = "data/train.bin",
     tokenizer_path: str = "data/tokenizer.json",
@@ -85,8 +86,11 @@ def prepare_dataset(
     os.makedirs(os.path.dirname(os.path.abspath(output_bin)), exist_ok=True)
     os.makedirs(os.path.dirname(os.path.abspath(tokenizer_path)), exist_ok=True)
 
-    print(f"Loading stream from {dataset_name} ({split})...")
-    ds = load_dataset(dataset_name, split=split, streaming=True)
+    print(f"Loading stream from {dataset_name} (subset={subset}, split={split})...")
+    if subset:
+        ds = load_dataset(dataset_name, subset, split=split, streaming=True)
+    else:
+        ds = load_dataset(dataset_name, split=split, streaming=True)
 
     texts = []
     print(f"Streaming {max_samples:,} samples for tokenizer training & packing...")
