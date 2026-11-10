@@ -107,16 +107,161 @@ def run_smoke_training(steps: int = 50, batch_size: int = 4, seq_len: int = 64):
         print(f"[Loop k={loop_k}] -> {gen}")
 
 
+def log_message(msg: str, log_file: str = "train.log"):
+    print(msg, flush=True)
+    if log_file:
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+
+
+def run_pretrain(
+    data_bin: str = "data/train.bin",
+    tokenizer_path: str = "data/tokenizer.json",
+    checkpoint_dir: str = "checkpoints",
+    steps: int = 5000,
+    batch_size: int = 8,
+    seq_len: int = 256,
+    grad_accum_steps: int = 2,
+    loops: int = 2,
+    lr: float = 6e-4,
+    warmup_steps: int = 100,
+    save_interval: int = 500,
+    eval_interval: int = 250,
+    log_file: str = "train.log",
+):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    log_message("==================================================", log_file)
+    log_message(f"=== Starting LT-1 Base Pre-Training ===", log_file)
+    log_message(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}", log_file)
+    log_message(f"Device: {device} | CUDA Available: {torch.cuda.is_available()}", log_file)
+    if device == "cuda":
+        log_message(f"GPU: {torch.cuda.get_device_name(0)} (Compute Capability {torch.cuda.get_device_capability(0)})", log_file)
+        log_message(f"Initial VRAM Allocated: {torch.cuda.memory_allocated() / (1024**2):.1f} MB", log_file)
+
+    # 1. Ensure dataset exists
+    if not os.path.exists(data_bin) or not os.path.exists(tokenizer_path):
+        log_message("Data binary or tokenizer missing. Preparing dataset from TinyStories...", log_file)
+        from src.data import prepare_dataset
+        prepare_dataset(output_bin=data_bin, tokenizer_path=tokenizer_path, max_samples=25000, vocab_size=4096)
+
+    tok = NanoTokenizer.load(tokenizer_path)
+    dataset = MemmapDataset(data_bin, seq_len=seq_len)
+    log_message(f"Dataset: {dataset.num_tokens:,} tokens loaded from {data_bin}", log_file)
+    log_message(f"Tokenizer: vocab_size={tok.vocab_size}", log_file)
+
+    # 2. Model & Config setup
+    cfg = base_config()
+    cfg.vocab_size = tok.vocab_size
+    cfg.max_seq_len = seq_len
+    model = LT1Model(cfg).to(device)
+
+    counts = model.count_parameters()
+    log_message(f"Model parameters: {counts['total']:,} total ({counts['dense_backbone']:,} dense, {counts['sparse_engram']:,} sparse Engram)", log_file)
+    log_message(f"Hyperparameters: Batch={batch_size}, SeqLen={seq_len}, Accum={grad_accum_steps}, EffectiveBatch={batch_size * grad_accum_steps}, Loops={loops}, Steps={steps}", log_file)
+
+    # 3. TriOptimizer setup
+    optimizer = TriOptimizer(model, muon_lr=0.02, adamw_lr=lr, sparse_lr=1e-2)
+
+    # 4. Training loop
+    model.train()
+    start_time = time.time()
+    running_loss = 0.0
+
+    for step in range(steps):
+        t0 = time.time()
+        optimizer.zero_grad()
+
+        # Dynamic loop scheduling: alternate loops or fixed loop depth
+        step_loops = loops if (step % 2 == 0) else max(1, loops // 2)
+
+        accum_loss = 0.0
+        for _ in range(grad_accum_steps):
+            x, y = dataset.get_batch(batch_size, device=device)
+            with torch.amp.autocast(device_type=device, dtype=torch.bfloat16 if device == "cuda" else torch.float32):
+                logits, loss = model(x, targets=y, num_loops=step_loops)
+                loss_scaled = loss / grad_accum_steps
+            loss_scaled.backward()
+            accum_loss += loss.item() / grad_accum_steps
+
+        # LR schedule
+        lr_scale = get_cosine_lr_scale(step, steps, warmup_steps=warmup_steps)
+        optimizer.set_lr_scale(lr_scale)
+        optimizer.step(max_norm=1.0)
+
+        running_loss += accum_loss
+        step_time = time.time() - t0
+        toks_per_sec = (batch_size * grad_accum_steps * seq_len) / max(1e-5, step_time)
+
+        if (step + 1) % 10 == 0 or step == 0:
+            avg_loss = running_loss / (10 if step > 0 else 1)
+            running_loss = 0.0
+            vram_gb = torch.cuda.max_memory_allocated() / (1024 ** 3) if device == "cuda" else 0.0
+            log_message(f"Step {step+1:05d}/{steps:05d} | Loss: {avg_loss:.4f} | LR: {lr * lr_scale:.2e} | Speed: {toks_per_sec:.0f} tok/s | Peak VRAM: {vram_gb:.2f} GB | Loops: {step_loops}", log_file)
+
+        # Periodic evaluation & sample generation
+        if (step + 1) % eval_interval == 0:
+            model.eval()
+            with torch.no_grad():
+                sample = generate_text(model, tok, "Once upon a time", max_new_tokens=30, num_loops=loops, temperature=0.7)
+            log_message(f"--- [Sample @ Step {step+1} (Loops={loops})] -> {sample}", log_file)
+            model.train()
+
+        # Periodic checkpointing
+        if (step + 1) % save_interval == 0 or (step + 1) == steps:
+            ckpt_path = os.path.join(checkpoint_dir, f"lt1_step_{step+1}.pt")
+            latest_path = os.path.join(checkpoint_dir, "latest.pt")
+            ckpt = {
+                "step": step + 1,
+                "config": cfg,
+                "model_state_dict": model.state_dict(),
+                "step_loss": accum_loss,
+            }
+            torch.save(ckpt, ckpt_path)
+            torch.save(ckpt, latest_path)
+            log_message(f"[Checkpoint Saved] -> {ckpt_path} & {latest_path}", log_file)
+
+    total_time = time.time() - start_time
+    log_message(f"Pre-training completed in {total_time/60:.2f} minutes!", log_file)
+
+
 def main():
     parser = argparse.ArgumentParser(description="LT-1 Training & Benchmark Entrypoint")
     parser.add_argument("--stage", type=str, default="smoke", choices=["smoke", "pretrain", "sft", "ncm-bench"])
-    parser.add_argument("--steps", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--seq-len", type=int, default=64)
+    parser.add_argument("--steps", type=int, default=5000)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--seq-len", type=int, default=256)
+    parser.add_argument("--grad-accum-steps", type=int, default=2)
+    parser.add_argument("--loops", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=6e-4)
+    parser.add_argument("--warmup-steps", type=int, default=100)
+    parser.add_argument("--save-interval", type=int, default=500)
+    parser.add_argument("--eval-interval", type=int, default=250)
+    parser.add_argument("--data-bin", type=str, default="data/train.bin")
+    parser.add_argument("--tokenizer-path", type=str, default="data/tokenizer.json")
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    parser.add_argument("--log-file", type=str, default="train.log")
     args = parser.parse_args()
 
     if args.stage == "smoke":
         run_smoke_training(steps=args.steps, batch_size=args.batch_size, seq_len=args.seq_len)
+    elif args.stage == "pretrain":
+        run_pretrain(
+            data_bin=args.data_bin,
+            tokenizer_path=args.tokenizer_path,
+            checkpoint_dir=args.checkpoint_dir,
+            steps=args.steps,
+            batch_size=args.batch_size,
+            seq_len=args.seq_len,
+            grad_accum_steps=args.grad_accum_steps,
+            loops=args.loops,
+            lr=args.lr,
+            warmup_steps=args.warmup_steps,
+            save_interval=args.save_interval,
+            eval_interval=args.eval_interval,
+            log_file=args.log_file,
+        )
     elif args.stage == "ncm-bench":
         print("Running NCM Multiscale Benchmark...")
         cfg = tiny_smoke_config()
@@ -124,6 +269,7 @@ def main():
         ctx = torch.randn(2, cfg.d_model)
         logits, passes = ncm.parallel_generate(ctx)
         print(f"NCM parallel generation: 16 tokens generated in {passes} passes! Output shape: {logits.shape}")
+
 
 
 if __name__ == "__main__":

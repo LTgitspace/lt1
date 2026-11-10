@@ -66,3 +66,52 @@ def encode_sft_turn(
         torch.tensor(full_ids[:max_seq_len], dtype=torch.long),
         torch.tensor(target_ids[:max_seq_len], dtype=torch.long),
     )
+
+
+def prepare_dataset(
+    dataset_name: str = "roneneldan/TinyStories",
+    split: str = "train",
+    output_bin: str = "data/train.bin",
+    tokenizer_path: str = "data/tokenizer.json",
+    max_samples: int = 25000,
+    vocab_size: int = 4096,
+) -> tuple[str, str]:
+    """
+    Streams a dataset from HuggingFace, trains a byte-level BPE tokenizer (if missing),
+    and packs token IDs into a memory-mapped uint16 binary shard.
+    """
+    from datasets import load_dataset
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_bin)), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(tokenizer_path)), exist_ok=True)
+
+    print(f"Loading stream from {dataset_name} ({split})...")
+    ds = load_dataset(dataset_name, split=split, streaming=True)
+
+    texts = []
+    print(f"Streaming {max_samples:,} samples for tokenizer training & packing...")
+    for i, item in enumerate(ds):
+        if i >= max_samples:
+            break
+        text = item.get("text", "")
+        if text and len(text.strip()) > 10:
+            texts.append(text.strip())
+
+    if not os.path.exists(tokenizer_path):
+        print(f"Training byte-level BPE tokenizer (vocab_size={vocab_size})...")
+        tok = NanoTokenizer.train_from_iterator(texts, vocab_size=vocab_size, save_path=tokenizer_path)
+    else:
+        print(f"Loading existing tokenizer from {tokenizer_path}...")
+        tok = NanoTokenizer.load(tokenizer_path)
+
+    print(f"Tokenizing {len(texts):,} texts into uint16 tokens...")
+    all_token_ids = []
+    for text in texts:
+        tokens = tok.encode(text) + [tok.eos_id]
+        all_token_ids.extend(tokens)
+
+    print(f"Packing {len(all_token_ids):,} tokens to {output_bin}...")
+    np.array(all_token_ids, dtype=np.uint16).tofile(output_bin)
+    print(f"Dataset preparation complete: {output_bin} ({len(all_token_ids):,} tokens, {os.path.getsize(output_bin) / (1024**2):.2f} MB)")
+    return output_bin, tokenizer_path
+
