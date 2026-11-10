@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# PyTorch checkpoints and large binaries
+*.pt
+*.pth
+*.bin
+*.safetensors
+checkpoints/
+data/cache/
+*.log
+
+# Virtual Environments
+.env
+.venv
+env/
+venv/
+
+# Editor artifacts
+.vscode/
+.idea/
+*.swp
