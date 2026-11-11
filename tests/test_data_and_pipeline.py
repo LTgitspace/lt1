@@ -31,6 +31,12 @@ class TestDataAndPipeline(unittest.TestCase):
         self.assertEqual(tgt.shape, (32,))
         self.assertGreaterEqual((tgt != -100).sum().item(), 1)
 
+        # Verify causal 1-token next-token shift on normal turns
+        inp2, tgt2 = encode_sft_turn(tok, "Hello world", "Short answer", max_seq_len=32)
+        for i in range(31):
+            if tgt2[i].item() != -100 and inp2[i + 1].item() != tok.pad_id:
+                self.assertEqual(tgt2[i].item(), inp2[i + 1].item())
+
     def test_end_to_end_overfit_convergence_and_generation(self):
         torch.manual_seed(1337)
         cfg = tiny_smoke_config()

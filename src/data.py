@@ -38,33 +38,39 @@ def encode_sft_turn(
     max_seq_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Encodes a (user, assistant) turn with user prompt targets masked to -100.
+    Encodes a (user, assistant) turn with prompt masking (-100) and causal 1-token target shift.
+    For every unmasked position i, target_ids[i] predicts full_seq[i + 1].
     Guarantees >= 1 unmasked assistant token even under heavy prompt truncation.
     """
     user_ids = [tokenizer.user_id] + tokenizer.encode(user_text) + [tokenizer.eos_id]
     asst_ids = [tokenizer.assistant_id] + tokenizer.encode(assistant_text) + [tokenizer.eos_id]
 
-    # Ensure assistant text has at least 1 token budget
-    if len(asst_ids) >= max_seq_len:
-        asst_ids = asst_ids[:max_seq_len - 1] + [tokenizer.eos_id]
+    total_budget = max_seq_len + 1
+    # Ensure assistant text has at least 2 tokens and user prompt keeps >= 1 context token
+    if len(asst_ids) >= total_budget:
+        asst_ids = asst_ids[:total_budget - 2] + [tokenizer.eos_id]
 
-    max_user_len = max_seq_len - len(asst_ids)
+    max_user_len = total_budget - len(asst_ids)
     if len(user_ids) > max_user_len:
         # Left-truncate prompt to fit context budget
-        user_ids = [tokenizer.user_id] + user_ids[-max_user_len + 1:]
+        user_ids = [tokenizer.user_id] + user_ids[-(max_user_len - 1):] if max_user_len > 1 else [tokenizer.user_id]
 
-    full_ids = user_ids + asst_ids
-    target_ids = [-100] * len(user_ids) + asst_ids
+    full_seq = user_ids + asst_ids
+    raw_targets = [-100] * len(user_ids) + asst_ids
+
+    # Shift for next-token prediction: x[i] predicts full_seq[i + 1]
+    inp_ids = full_seq[:-1]
+    tgt_ids = raw_targets[1:]
 
     # Pad if shorter than max_seq_len
-    if len(full_ids) < max_seq_len:
-        pad_len = max_seq_len - len(full_ids)
-        full_ids = full_ids + [tokenizer.pad_id] * pad_len
-        target_ids = target_ids + [-100] * pad_len
+    if len(inp_ids) < max_seq_len:
+        pad_len = max_seq_len - len(inp_ids)
+        inp_ids = inp_ids + [tokenizer.pad_id] * pad_len
+        tgt_ids = tgt_ids + [-100] * pad_len
 
     return (
-        torch.tensor(full_ids[:max_seq_len], dtype=torch.long),
-        torch.tensor(target_ids[:max_seq_len], dtype=torch.long),
+        torch.tensor(inp_ids[:max_seq_len], dtype=torch.long),
+        torch.tensor(tgt_ids[:max_seq_len], dtype=torch.long),
     )
 
 

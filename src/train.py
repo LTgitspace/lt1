@@ -190,6 +190,7 @@ def run_pretrain(
     optimizer = TriOptimizer(model, muon_lr=muon_lr, adamw_lr=lr, sparse_lr=1e-2)
 
     # 4. Training loop
+    latest_path = os.path.join(checkpoint_dir, "latest.pt")
     model.train()
     start_time = time.time()
     running_loss = 0.0
@@ -252,9 +253,14 @@ def run_pretrain(
 
     # 5. Auto-Chained Conversational SFT Stage
     if chain_sft:
+        del optimizer
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
         base_exp_path = os.path.join(checkpoint_dir, "lt1_1b_base_inference.pt")
-        log_message(f"Exporting base 1B inference checkpoint to {base_exp_path}...", log_file)
-        export_checkpoint(latest_path, base_exp_path, tokenizer_path=tokenizer_path, device=device)
+        if not (start_step >= steps and os.path.exists(base_exp_path)):
+            log_message(f"Exporting base 1B inference checkpoint to {base_exp_path}...", log_file)
+            export_checkpoint(resume_target or latest_path, base_exp_path, tokenizer_path=tokenizer_path, device="cpu")
 
         if not os.path.exists(sft_pt):
             log_message(f"SFT shard {sft_pt} missing, preparing multi-domain SFT dataset...", log_file)
@@ -291,6 +297,13 @@ def run_pretrain(
                 vram_gb = torch.cuda.max_memory_allocated() / (1024 ** 3) if device == "cuda" else 0.0
                 log_message(f"[SFT Step {sft_step+1:04d}/{sft_steps:04d}] Loss: {accum_loss:.4f} | LR: {sft_lr * lr_scale:.2e} | Peak VRAM: {vram_gb:.2f} GB", log_file)
 
+            if (sft_step + 1) % 250 == 0:
+                model.eval()
+                with torch.no_grad():
+                    sft_sample = generate_text(model, tok, "What does profit margin mean in finance?", max_new_tokens=30, num_loops=loops, temperature=0.5)
+                log_message(f"--- [SFT Sample @ Step {sft_step+1}] -> {sft_sample}", log_file)
+                model.train()
+
         sft_ckpt_path = os.path.join(checkpoint_dir, "lt1_1b_chat_sft.pt")
         torch.save({
             "step": steps + sft_steps,
@@ -299,6 +312,10 @@ def run_pretrain(
             "is_chat_model": True,
             "step_loss": accum_loss,
         }, sft_ckpt_path)
+
+        del model, optimizer
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
         chat_exp_path = os.path.join(checkpoint_dir, "lt1_1b_chat_inference.pt")
         log_message(f"Exporting chat 1B inference checkpoint to {chat_exp_path}...", log_file)
