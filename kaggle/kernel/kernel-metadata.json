@@ -1,5 +1,5 @@
 {
-  "id": "ltnanhtun/lt1-1b-extended-pretrain",
+  "id": "ltnanhtun/lt-1-1b-extended-pretrain",
   "title": "LT-1 1B Extended Pretrain",
   "code_file": "train_kaggle.py",
   "language": "python",
