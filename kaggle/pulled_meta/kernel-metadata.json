@@ -1,0 +1,21 @@
+{
+  "id": "ltnanhtun/lt-1-1b-extended-pretrain",
+  "id_no": 144324119,
+  "title": "LT-1 1B Extended Pretrain",
+  "code_file": "lt-1-1b-extended-pretrain.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "keywords": [],
+  "dataset_sources": [
+    "ltnanhtun/lt1-pretrain-data"
+  ],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": [],
+  "docker_image": "",
+  "machine_shape": "NvidiaTeslaT4"
+}

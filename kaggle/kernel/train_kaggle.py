@@ -1,13 +1,16 @@
 """
 LT-1 (1.00B) Extended Pre-training & Conversational SFT Runner on Kaggle GPU.
-Handles repository cloning, dataset discovery/symlinking, execution, and artifact tracking.
+Supports 100% offline execution via bundled lt1_src/ in the attached Kaggle dataset,
+with GitHub clone fallback when outbound internet is active.
 """
 import os
 import sys
-import subprocess
 import shutil
+import zipfile
+import subprocess
 from pathlib import Path
 import torch
+
 
 def main():
     print("=" * 60)
@@ -20,32 +23,22 @@ def main():
     cuda_avail = torch.cuda.is_available()
     print(f"CUDA Available: {cuda_avail}")
     if cuda_avail:
-        device_name = torch.cuda.get_device_name(0)
-        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        print(f"Active GPU: {device_name} ({vram_gb:.2f} GB VRAM)")
+        n_gpus = torch.cuda.device_count()
+        for i in range(n_gpus):
+            device_name = torch.cuda.get_device_name(i)
+            vram_gb = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+            print(f"GPU {i}: {device_name} ({vram_gb:.2f} GB VRAM)")
     else:
-        print("[WARNING] CUDA not detected! Check GPU accelerator setting in Kaggle.")
+        print("[ERROR] CUDA is NOT available in this container (PyTorch CPU build detected).")
+        print("Why this happens on Kaggle even with enable_gpu=true:")
+        print("  1. Your Kaggle account must be Phone Verified at https://www.kaggle.com/settings")
+        print("     to unlock GPU accelerators and outbound Internet in Kernels.")
+        print("  2. Or open https://www.kaggle.com/code/ltnanhtun/lt-1-1b-extended-pretrain/edit")
+        print("     and select Accelerator -> GPU T4 x2 / P100 in the right-hand Session Options panel.")
+        sys.exit(1)
 
-    # 2. Clone or Update LT-1 Repository
-    working_dir = Path("/kaggle/working")
-    repo_dir = working_dir / "lt1"
-
-    if not repo_dir.exists():
-        print(f"Cloning LT-1 from GitHub into {repo_dir}...")
-        subprocess.run(["git", "clone", "https://github.com/LTgitspace/lt1.git", str(repo_dir)], check=True)
-    else:
-        print(f"Repository already exists at {repo_dir}. Pulling latest...")
-        subprocess.run(["git", "-C", str(repo_dir), "pull"], check=False)
-
-    os.chdir(str(repo_dir))
-    if str(repo_dir) not in sys.path:
-        sys.path.insert(0, str(repo_dir))
-
-    # 3. Locate and Symlink Kaggle Input Dataset Files
+    # 2. Locate Kaggle Input Dataset
     input_root = Path("/kaggle/input")
-    data_dir = repo_dir / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-
     found_train_bin = None
     for p in input_root.rglob("train_mix.bin"):
         found_train_bin = p
@@ -58,6 +51,32 @@ def main():
     src_dir = found_train_bin.parent
     print(f"Located Kaggle dataset files in: {src_dir}")
 
+    # 3. Setup Working Codebase (Prefer offline lt1_src/ or lt1_src.zip from dataset, fallback to git clone)
+    working_dir = Path("/kaggle/working")
+    repo_dir = working_dir / "lt1"
+    unpacked_src = src_dir / "lt1_src"
+    src_zip = src_dir / "lt1_src.zip"
+
+    if unpacked_src.exists():
+        print(f"Copying bundled source code from {unpacked_src} into {repo_dir}...")
+        shutil.copytree(unpacked_src, repo_dir, dirs_exist_ok=True)
+    elif src_zip.exists():
+        print(f"Extracting bundled source code from {src_zip} into {repo_dir}...")
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(src_zip, "r") as zf:
+            zf.extractall(repo_dir)
+    elif not repo_dir.exists():
+        print(f"Cloning LT-1 from GitHub into {repo_dir}...")
+        subprocess.run(["git", "clone", "https://github.com/LTgitspace/lt1.git", str(repo_dir)], check=True)
+
+    os.chdir(str(repo_dir))
+    if str(repo_dir) not in sys.path:
+        sys.path.insert(0, str(repo_dir))
+
+    # 4. Symlink Dataset Files into repo_dir/data
+    data_dir = repo_dir / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
     target_files = ["tokenizer_cosmo.json", "tokenizer.json", "train_mix.bin", "sft_mix.pt"]
     for fname in target_files:
         s = src_dir / fname
@@ -68,11 +87,11 @@ def main():
             print(f"Symlinking: {s.name} -> data/{d.name}")
             d.symlink_to(s)
 
-    # 4. Prepare Output Checkpoints Directory in /kaggle/working
+    # 5. Prepare Output Checkpoints Directory in /kaggle/working
     ckpt_dir = repo_dir / "checkpoints_1b"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # 5. Execute Extended Pre-training (25,000 steps) chained into SFT (1,000 steps)
+    # 6. Execute Extended Pre-training (25,000 steps) chained into SFT (1,000 steps)
     print("\n" + "=" * 60)
     print("=== Launching Extended Pre-training (25,000 Steps) ===")
     print("Batch: 8 | SeqLen: 256 | GradAccum: 4 | EffectiveBatch: 32")
@@ -120,6 +139,7 @@ def main():
         print("Checkpoints saved to /kaggle/working/lt1/checkpoints_1b")
     print("=" * 60)
     sys.exit(ret)
+
 
 if __name__ == "__main__":
     main()

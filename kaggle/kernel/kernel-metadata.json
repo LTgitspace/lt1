@@ -4,10 +4,12 @@
   "code_file": "train_kaggle.py",
   "language": "python",
   "kernel_type": "script",
-  "is_private": "true",
-  "enable_gpu": "true",
-  "enable_tpu": "false",
-  "enable_internet": "true",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "docker_image_pinning_type": "latest",
+  "machine_shape": "NvidiaTeslaT4",
   "dataset_sources": [
     "ltnanhtun/lt1-pretrain-data"
   ],

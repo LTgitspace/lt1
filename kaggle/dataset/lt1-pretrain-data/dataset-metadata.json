@@ -1,9 +1,34 @@
 {
   "title": "LT-1 Pretrain Data",
+  "subtitle": "Tokenized multi-domain pretraining corpus, SFT mix, and source for LT-1 (1.00B)",
+  "description": "Pre-tokenized binary corpus (train_mix.bin, ~28.96M tokens), 8192-vocab BPE tokenizer (tokenizer_cosmo.json), causal-shifted conversational SFT dataset (sft_mix.pt, 19,933 pairs), and offline source bundle (lt1_src/) for the LT-1 1.00B CED-MoE-NCM language model.",
   "id": "ltnanhtun/lt1-pretrain-data",
   "licenses": [
     {
       "name": "MIT"
+    }
+  ],
+  "keywords": [
+    "nlp",
+    "deep learning",
+    "pytorch"
+  ],
+  "resources": [
+    {
+      "path": "train_mix.bin",
+      "description": "Memory-mapped uint16 token stream (~28.96M tokens across Cosmopedia, FineWeb-Edu, and domain corpora)"
+    },
+    {
+      "path": "tokenizer_cosmo.json",
+      "description": "8192-vocabulary BPE tokenizer trained for LT-1 1B scale"
+    },
+    {
+      "path": "tokenizer.json",
+      "description": "4096-vocabulary BPE tokenizer for base scale"
+    },
+    {
+      "path": "sft_mix.pt",
+      "description": "19,933 causal-shifted conversational QA turns for supervised fine-tuning"
     }
   ]
 }
