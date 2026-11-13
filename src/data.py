@@ -349,6 +349,40 @@ def prepare_scaled_multidomain_datasets(
             _add_tokens(buf)
         print(f"  -> Collected {collected:,} tokens from {label}")
 
+    def _extract_magicoder(r):
+        prob = (r.get("problem") or "").strip()
+        sol = (r.get("solution") or "").strip()
+        if not prob or not sol:
+            return "", None
+        return f"Programming Task: {prob}\nSolution:\n{sol}", (prob, sol)
+
+    def _extract_metamath(r):
+        q = (r.get("query") or "").strip()
+        a = (r.get("response") or "").strip()
+        if not q or not a:
+            return "", None
+        return f"Math Problem: {q}\nSolution: {a}", (q, a)
+
+    def _extract_finance(r):
+        inst = (r.get("instruction") or "").strip()
+        inp = (r.get("input") or "").strip()
+        out = (r.get("output") or "").strip()
+        if not out:
+            return "", None
+        prompt = f"{inst} {inp}".strip()
+        sft_prompt = f"{inst}\n{inp}".strip() if inp else inst
+        return f"Financial Knowledge: {prompt}\nAnswer: {out}", ((sft_prompt, out) if inst else None)
+
+    def _extract_ultrachat(r):
+        msgs = r.get("messages") or []
+        if len(msgs) < 2:
+            return "", None
+        u = (msgs[0].get("content") or "").strip()
+        a = (msgs[1].get("content") or "").strip()
+        if not u or not a:
+            return "", None
+        return f"Conversation:\nUser: {u}\nAssistant: {a}", (u, a)
+
     # Domain budgets scaled proportionally to target_pretrain_tokens
     remaining_budget = max(10_000_000, target_pretrain_tokens - total_tokens)
     _stream_into_shard(
@@ -356,7 +390,7 @@ def prepare_scaled_multidomain_datasets(
         "HuggingFaceFW/fineweb-edu",
         "train",
         int(remaining_budget * 0.45),
-        lambda r: (r.get("text", "").strip(), None),
+        lambda r: ((r.get("text") or "").strip(), None),
         config_name="sample-10BT",
     )
     _stream_into_shard(
@@ -364,56 +398,28 @@ def prepare_scaled_multidomain_datasets(
         "ise-uiuc/Magicoder-OSS-Instruct-75K",
         "train",
         int(remaining_budget * 0.20),
-        lambda r: (
-            f"Programming Task: {r.get('problem', '').strip()}\nSolution:\n{r.get('solution', '').strip()}"
-            if r.get("problem") and r.get("solution")
-            else ("", None),
-            (r.get("problem", "").strip(), r.get("solution", "").strip())
-            if r.get("problem") and r.get("solution")
-            else None,
-        ),
+        _extract_magicoder,
     )
     _stream_into_shard(
         "Math (MetaMathQA)",
         "meta-math/MetaMathQA",
         "train",
         int(remaining_budget * 0.15),
-        lambda r: (
-            f"Math Problem: {r.get('query', '').strip()}\nSolution: {r.get('response', '').strip()}"
-            if r.get("query") and r.get("response")
-            else ("", None),
-            (r.get("query", "").strip(), r.get("response", "").strip())
-            if r.get("query") and r.get("response")
-            else None,
-        ),
+        _extract_metamath,
     )
     _stream_into_shard(
         "Finance-Alpaca",
         "gbharti/finance-alpaca",
         "train",
         int(remaining_budget * 0.08),
-        lambda r: (
-            f"Financial Knowledge: {(r.get('instruction', '') + ' ' + r.get('input', '')).strip()}\nAnswer: {r.get('output', '').strip()}"
-            if r.get("output")
-            else ("", None),
-            ((r.get("instruction", "") + "\n" + r.get("input", "")).strip(), r.get("output", "").strip())
-            if r.get("instruction") and r.get("output")
-            else None,
-        ),
+        _extract_finance,
     )
     _stream_into_shard(
         "UltraChat 200k",
         "HuggingFaceH4/ultrachat_200k",
         "train_sft",
         int(remaining_budget * 0.12),
-        lambda r: (
-            f"Conversation:\nUser: {r['messages'][0]['content'].strip()}\nAssistant: {r['messages'][1]['content'].strip()}"
-            if len(r.get("messages", [])) >= 2
-            else ("", None),
-            (r["messages"][0]["content"].strip(), r["messages"][1]["content"].strip())
-            if len(r.get("messages", [])) >= 2
-            else None,
-        ),
+        _extract_ultrachat,
     )
 
     random.seed(42)
