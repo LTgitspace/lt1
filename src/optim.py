@@ -38,6 +38,7 @@ class Muon(Optimizer):
         nesterov: bool = True,
         ns_steps: int = 5,
         weight_decay: float = 0.01,
+        use_fp32_master_weights: bool = False,
     ):
         defaults = dict(
             lr=lr,
@@ -45,6 +46,7 @@ class Muon(Optimizer):
             nesterov=nesterov,
             ns_steps=ns_steps,
             weight_decay=weight_decay,
+            use_fp32_master_weights=use_fp32_master_weights,
         )
         super().__init__(params, defaults)
 
@@ -56,6 +58,7 @@ class Muon(Optimizer):
             nesterov = group["nesterov"]
             ns_steps = group["ns_steps"]
             weight_decay = group["weight_decay"]
+            use_master = group.get("use_fp32_master_weights", False)
 
             for p in group["params"]:
                 if p.grad is None:
@@ -71,18 +74,27 @@ class Muon(Optimizer):
                 buf = state["momentum_buffer"]
                 buf.mul_(momentum).add_(g)
 
-                if weight_decay != 0:
-                    g = g.add(p, alpha=weight_decay)
-
                 if nesterov:
                     update = g.add(buf, alpha=momentum)
                 else:
                     update = buf
 
+                # Orthogonalize ONLY the gradient/momentum update (never couple weight decay inside Newton-Schulz)
                 u_orth = zeropower_via_newtonschulz5(update, steps=ns_steps)
-                # Aspect ratio scaling
                 scale = max(1.0, p.size(-2) / p.size(-1)) ** 0.5
-                p.add_(u_orth, alpha=-lr * scale)
+
+                if use_master and p.dtype == torch.bfloat16:
+                    if "master_param" not in state:
+                        state["master_param"] = p.detach().float().clone()
+                    mp = state["master_param"]
+                    if weight_decay != 0:
+                        mp.mul_(1.0 - lr * weight_decay)
+                    mp.add_(u_orth.float(), alpha=-lr * scale)
+                    p.copy_(mp.to(torch.bfloat16))
+                else:
+                    if weight_decay != 0:
+                        p.mul_(1.0 - lr * weight_decay)
+                    p.add_(u_orth, alpha=-lr * scale)
 
 
 class TriOptimizer:
@@ -107,19 +119,20 @@ class TriOptimizer:
         muon_params = []
         adamw_params = []
 
-        # Identify sparse engram table IDs
+        # Identify sparse engram table IDs (only for standard nn.Embedding(sparse=True) mode)
         sparse_ids = set()
-        if not model.cfg.engram_offload_cpu:
+        if not getattr(model.engram_1, "use_factored_rms", False):
             if hasattr(model.engram_1, "table") and model.engram_1.table is not None:
                 sparse_ids.add(id(model.engram_1.table.weight))
             if hasattr(model.engram_2, "table") and model.engram_2.table is not None:
                 sparse_ids.add(id(model.engram_2.table.weight))
 
-        # Excluded from Muon (must use AdamW)
-
+        # Excluded from Muon (embeddings, gates, routers, and classification heads must use AdamW)
         excluded_from_muon = {
             id(model.tok_emb.weight),
             id(model.loop_inj_gates),
+            id(model.ncm_bridge.next_concept_head.weight),
+            id(model.ncm_bridge.w_gate.weight),
         }
         for m in model.modules():
             if isinstance(m, nn.Linear) and m.out_features == model.cfg.moe_n_routed_experts:
@@ -137,9 +150,14 @@ class TriOptimizer:
                 adamw_params.append(p)
 
         self.dense_params = muon_params + adamw_params
+        use_master = getattr(model.cfg, "use_fp32_master_weights", False)
 
         self.sparse_adam = SparseAdam(sparse_params, lr=sparse_lr) if sparse_params else None
-        self.muon = Muon(muon_params, lr=muon_lr, weight_decay=weight_decay) if muon_params else None
+        self.muon = (
+            Muon(muon_params, lr=muon_lr, weight_decay=weight_decay, use_fp32_master_weights=use_master)
+            if muon_params
+            else None
+        )
         self.adamw = AdamW(adamw_params, lr=adamw_lr, betas=(0.9, 0.95), weight_decay=weight_decay) if adamw_params else None
 
     def zero_grad(self):
@@ -157,7 +175,7 @@ class TriOptimizer:
 
         if self.sparse_adam:
             self.sparse_adam.step()
-        elif getattr(self.model.cfg, "engram_offload_cpu", False):
+        elif getattr(self.model.engram_1, "use_factored_rms", False):
             sparse_lr = self.base_lrs["sparse"] * getattr(self, "_lr_scale", 1.0)
             self.model.engram_1.step_sparse_rms(sparse_lr)
             self.model.engram_2.step_sparse_rms(sparse_lr)

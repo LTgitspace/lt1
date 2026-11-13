@@ -18,7 +18,7 @@ class CEDKVCache:
         self.bridge_kv: tuple[torch.Tensor, torch.Tensor] | None = None
         self.anchor_kv: tuple[torch.Tensor, torch.Tensor] | None = None
         self.prev_tokens: torch.Tensor | None = None
-        self.prev_enc_states: torch.Tensor | None = None
+        self.prev_enc_states: list[torch.Tensor] | None = None
         self.seq_len: int = 0
 
     def reset(self):
@@ -161,6 +161,7 @@ class LT1Model(nn.Module):
 
         # Token embedding and RoPE precomputations
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
         cos, sin = precompute_rope_cos_sin(cfg.head_dim, cfg.max_seq_len, theta=cfg.rope_theta)
         self.register_buffer("cos_cached", cos)
         self.register_buffer("sin_cached", sin)
@@ -205,27 +206,38 @@ class LT1Model(nn.Module):
         ])
         self.final_norm = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
         self.is_packed_inference = False
+        self.last_loss_dict: dict[str, float] = {}
 
         if cfg.use_bf16_weights:
-            # Cast GPU-resident backbone modules to bfloat16 to cut VRAM by 50%
-            self.tok_emb.bfloat16()
+            # Cast large 2D linear weights to bfloat16 to cut VRAM by 50%,
+            # while keeping AdamW-updated 1D norms, tok_emb, routers, and classifier heads in float32
+            # so small AdamW updates do not underflow bfloat16's 7-bit mantissa.
             self.eng_proj_norm_to_bf16()
             self.encoder_layers.bfloat16()
-            self.enc_norm.bfloat16()
             self.ncm_bridge.bfloat16()
             self.bridge_wk.bfloat16()
             self.bridge_wv.bfloat16()
             self.recurrent_layers.bfloat16()
             self.loop_inj_proj.bfloat16()
-            self.loop_bound_norm.bfloat16()
             self.coda_layers.bfloat16()
-            self.final_norm.bfloat16()
+            self._keep_adamw_params_fp32()
+
+    def _keep_adamw_params_fp32(self):
+        self.tok_emb.float()
+        self.enc_norm.float()
+        self.loop_bound_norm.float()
+        self.final_norm.float()
+        self.ncm_bridge.next_concept_head.float()
+        for m in self.modules():
+            if isinstance(m, RMSNorm):
+                m.float()
+            elif hasattr(m, "router") and isinstance(m.router, nn.Linear):
+                m.router.float()
 
     def eng_proj_norm_to_bf16(self):
         for eng in (self.engram_1, self.engram_2):
             eng.w_proj.bfloat16()
             eng.w_gate.bfloat16()
-            eng.rms_norm.bfloat16()
 
     def pack_for_inference(self, device: torch.device | str = "cuda"):
         self.eval()
@@ -312,6 +324,8 @@ class LT1Model(nn.Module):
 
         # 1. Embedding + Engram 1
         x = self.tok_emb(token_ids)
+        if self.cfg.use_bf16_weights:
+            x = x.to(torch.bfloat16)
         x = self.engram_1(x, ngram_hashes)
 
         # 2. Stage 1: Causal Encoder Prelude
@@ -327,7 +341,10 @@ class LT1Model(nn.Module):
 
         # 3. CED-NCM Bridge (Causal Multiscale RVQ)
         prev_enc = kv_cache.prev_enc_states if kv_cache is not None else None
-        h_enc, commit_loss, next_concept_loss, _ = self.ncm_bridge(h_enc, prev_enc_states=prev_enc)
+        new_prev_enc = [] if kv_cache is not None else None
+        h_enc, commit_loss, next_concept_loss, _ = self.ncm_bridge(
+            h_enc, prev_enc_states=prev_enc, new_prev_states_out=new_prev_enc
+        )
 
         # 4. CED Global KV Bridge projection
         if kv_cache is not None and kv_cache.bridge_kv is not None:
@@ -385,7 +402,7 @@ class LT1Model(nn.Module):
 
         # 7. Final Norm & Tied LM Head
         coda_normed = self.final_norm(coda_x)
-        logits = F.linear(coda_normed, self.tok_emb.weight)
+        logits = F.linear(coda_normed, self.tok_emb.weight.to(coda_normed.dtype))
 
         # Update cache state if provided
         if kv_cache is not None:
@@ -394,11 +411,7 @@ class LT1Model(nn.Module):
                 kv_cache.prev_tokens = token_ids[:, -2:].clone()
             else:
                 kv_cache.prev_tokens = torch.cat([kv_cache.prev_tokens, token_ids], dim=1)[:, -2:].clone()
-
-            if kv_cache.prev_enc_states is None:
-                kv_cache.prev_enc_states = h_enc[:, -3:].clone()
-            else:
-                kv_cache.prev_enc_states = torch.cat([kv_cache.prev_enc_states, h_enc], dim=1)[:, -3:].clone()
+            kv_cache.prev_enc_states = new_prev_enc
 
         # 8. Compute total loss if targets given
         total_loss = None
@@ -406,6 +419,11 @@ class LT1Model(nn.Module):
             vocab_s = self.cfg.vocab_size
             ce_loss = F.cross_entropy(logits.view(-1, vocab_s), targets.view(-1), ignore_index=-100)
             total_loss = ce_loss + 0.1 * commit_loss + 0.1 * next_concept_loss
+            self.last_loss_dict = {
+                "ce_loss": ce_loss.item(),
+                "commit_loss": commit_loss.item(),
+                "next_concept_loss": next_concept_loss.item(),
+            }
 
         return logits, total_loss
 

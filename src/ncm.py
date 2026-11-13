@@ -61,12 +61,13 @@ class EMACodebook(nn.Module):
             return z_q, indices, commit_loss, metrics
 
         # Compute squared Euclidean distances: ||z - e||^2 = ||z||^2 + ||e||^2 - 2 * z @ e.T
+        embed_fp32 = self.embedding.float()
         z_sq = z_flat.pow(2).sum(dim=-1, keepdim=True)
-        e_sq = self.embedding.pow(2).sum(dim=-1, keepdim=True).T
-        dist = z_sq + e_sq - 2.0 * (z_flat @ self.embedding.T)
+        e_sq = embed_fp32.pow(2).sum(dim=-1, keepdim=True).T
+        dist = z_sq + e_sq - 2.0 * (z_flat @ embed_fp32.T)
 
         indices = torch.argmin(dist, dim=-1)
-        z_q_flat = self.embedding[indices]
+        z_q_flat = embed_fp32[indices]
         z_q = z_flat + (z_q_flat - z_flat).detach() # Straight-Through Estimator
 
         # Commitment loss
@@ -173,7 +174,8 @@ class CausalMultiscaleRVQ(nn.Module):
     def forward(
         self,
         h_enc: torch.Tensor,
-        prev_enc_states: torch.Tensor | None = None,
+        prev_enc_states: list[torch.Tensor] | torch.Tensor | None = None,
+        new_prev_states_out: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """
         h_enc: [B, T, D]
@@ -186,8 +188,18 @@ class CausalMultiscaleRVQ(nn.Module):
         first_scale_indices = None
 
         for s_idx, (scale_w, codebook) in enumerate(zip(self.scales, self.codebooks)):
+            if isinstance(prev_enc_states, list):
+                prev_s = prev_enc_states[s_idx] if s_idx < len(prev_enc_states) else None
+            else:
+                prev_s = prev_enc_states if s_idx == 0 else None
+
+            if new_prev_states_out is not None:
+                hist = torch.cat([prev_s, residual], dim=1) if (prev_s is not None and prev_s.numel() > 0) else residual
+                max_hist = max(self.scales) - 1
+                new_prev_states_out.append(hist[:, -max_hist:].clone() if max_hist > 0 else hist[:, :0].clone())
+
             # Causal left-window pool for this scale
-            pooled = causal_left_window_pool(residual, scale_w, prev_enc_states)
+            pooled = causal_left_window_pool(residual, scale_w, prev_s)
             q_s, idx_s, c_loss, m = codebook(pooled)
 
             if s_idx == 0:
@@ -199,14 +211,14 @@ class CausalMultiscaleRVQ(nn.Module):
             scale_metrics[f"scale_{scale_w}_active_ratio"] = m["active_ratio"]
 
         # Context-gated injection into encoder hidden states
-        gate = torch.sigmoid(self.w_gate(h_enc))
+        gate = torch.sigmoid(self.w_gate(h_enc.to(self.w_gate.weight.dtype))).to(h_enc.dtype)
         h_out = h_enc + gate * quantized_accum
 
         # Auxiliary next-concept prediction loss (predicting coarse concept code at span t + 4)
         next_concept_loss = torch.tensor(0.0, device=h_enc.device, dtype=h_enc.dtype)
         if not getattr(self, "is_packed_inference", False):
             if first_scale_indices is not None and h_enc.shape[1] > 4:
-                pred_logits = self.next_concept_head(h_enc[:, :-4]) # [B, T - 4, num_codes]
+                pred_logits = self.next_concept_head(h_enc[:, :-4].to(self.next_concept_head.weight.dtype)) # [B, T - 4, num_codes]
                 targets = first_scale_indices[:, 4:]                 # [B, T - 4]
                 next_concept_loss = F.cross_entropy(
                     pred_logits.reshape(-1, pred_logits.shape[-1]),

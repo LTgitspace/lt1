@@ -57,6 +57,8 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
             cos = cos.unsqueeze(0)
             sin = sin.unsqueeze(0)
 
+    cos = cos.to(x.dtype)
+    sin = sin.to(x.dtype)
     return (x * cos) + (x_rot * sin)
 
 

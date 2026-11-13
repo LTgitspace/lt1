@@ -264,3 +264,210 @@ def prepare_multidomain_datasets(
     return out_train_bin, out_sft_pt
 
 
+def prepare_scaled_multidomain_datasets(
+    tokenizer_path: str = "data/tokenizer_cosmo.json",
+    out_train_bin: str = "data/train_mix_scaled.bin",
+    out_sft_pt: str = "data/sft_mix_scaled.pt",
+    existing_cosmo_bin: str | None = "data/train_cosmo.bin",
+    target_pretrain_tokens: int = 150_000_000,
+    max_sft_turns: int = 50000,
+    seq_len: int = 512,
+) -> tuple[str, str]:
+    """
+    Streams and packs a large-scale (100M-250M token) 5-domain pre-training binary shard
+    and a 50,000+ turn causal-shifted Conversational SFT shard for Colab L4/A100 training:
+      1. Educational & Web Reasoning (FineWeb-Edu + Cosmopedia v2)
+      2. Code & Systems Engineering (Magicoder-OSS-Instruct-75K)
+      3. Math & Step-by-Step Logic (MetaMathQA / GSM8K)
+      4. Finance & Economics (Finance-Alpaca)
+      5. Multi-Turn Daily & Technical Conversation (UltraChat 200k + DialogSum)
+    """
+    from datasets import load_dataset
+    import random
+
+    os.makedirs(os.path.dirname(os.path.abspath(out_train_bin)), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(out_sft_pt)), exist_ok=True)
+    tok = NanoTokenizer.load(tokenizer_path)
+
+    chunks = []
+    total_tokens = 0
+    chunk_sz = 1024
+
+    def _add_tokens(tok_list: list[int]):
+        nonlocal total_tokens
+        if not tok_list:
+            return
+        arr = np.array(tok_list, dtype=np.uint16)
+        total_tokens += len(arr)
+        for i in range(0, len(arr), chunk_sz):
+            chunks.append(arr[i : i + chunk_sz])
+
+    if existing_cosmo_bin and os.path.exists(existing_cosmo_bin):
+        cosmo_arr = np.fromfile(existing_cosmo_bin, dtype=np.uint16)
+        total_tokens += len(cosmo_arr)
+        for i in range(0, len(cosmo_arr), chunk_sz):
+            chunks.append(cosmo_arr[i : i + chunk_sz])
+        print(f"Loaded existing Cosmopedia tokens: {len(cosmo_arr):,}")
+
+    sft_pairs: list[tuple[str, str]] = []
+
+    def _stream_into_shard(
+        label: str,
+        dataset_name: str,
+        split: str,
+        token_budget: int,
+        extractor,
+        config_name: str | None = None,
+    ):
+        print(f"Streaming {label} ({dataset_name}) up to {token_budget:,} tokens...")
+        try:
+            ds = (
+                load_dataset(dataset_name, config_name, split=split, streaming=True)
+                if config_name
+                else load_dataset(dataset_name, split=split, streaming=True)
+            )
+        except Exception as e:
+            print(f"[WARN] Skipping {dataset_name}: {e}")
+            return
+
+        buf: list[int] = []
+        collected = 0
+        for row in ds:
+            text_out, pair = extractor(row)
+            if text_out:
+                ids = tok.encode(text_out) + [tok.eos_id]
+                buf.extend(ids)
+                collected += len(ids)
+                if len(buf) >= 200_000:
+                    _add_tokens(buf)
+                    buf.clear()
+            if pair is not None and len(sft_pairs) < max_sft_turns * 2:
+                sft_pairs.append(pair)
+            if collected >= token_budget:
+                break
+        if buf:
+            _add_tokens(buf)
+        print(f"  -> Collected {collected:,} tokens from {label}")
+
+    # Domain budgets scaled proportionally to target_pretrain_tokens
+    remaining_budget = max(10_000_000, target_pretrain_tokens - total_tokens)
+    _stream_into_shard(
+        "FineWeb-Edu",
+        "HuggingFaceFW/fineweb-edu",
+        "train",
+        int(remaining_budget * 0.45),
+        lambda r: (r.get("text", "").strip(), None),
+        config_name="sample-10BT",
+    )
+    _stream_into_shard(
+        "Code (Magicoder)",
+        "ise-uiuc/Magicoder-OSS-Instruct-75K",
+        "train",
+        int(remaining_budget * 0.20),
+        lambda r: (
+            f"Programming Task: {r.get('problem', '').strip()}\nSolution:\n{r.get('solution', '').strip()}"
+            if r.get("problem") and r.get("solution")
+            else ("", None),
+            (r.get("problem", "").strip(), r.get("solution", "").strip())
+            if r.get("problem") and r.get("solution")
+            else None,
+        ),
+    )
+    _stream_into_shard(
+        "Math (MetaMathQA)",
+        "meta-math/MetaMathQA",
+        "train",
+        int(remaining_budget * 0.15),
+        lambda r: (
+            f"Math Problem: {r.get('query', '').strip()}\nSolution: {r.get('response', '').strip()}"
+            if r.get("query") and r.get("response")
+            else ("", None),
+            (r.get("query", "").strip(), r.get("response", "").strip())
+            if r.get("query") and r.get("response")
+            else None,
+        ),
+    )
+    _stream_into_shard(
+        "Finance-Alpaca",
+        "gbharti/finance-alpaca",
+        "train",
+        int(remaining_budget * 0.08),
+        lambda r: (
+            f"Financial Knowledge: {(r.get('instruction', '') + ' ' + r.get('input', '')).strip()}\nAnswer: {r.get('output', '').strip()}"
+            if r.get("output")
+            else ("", None),
+            ((r.get("instruction", "") + "\n" + r.get("input", "")).strip(), r.get("output", "").strip())
+            if r.get("instruction") and r.get("output")
+            else None,
+        ),
+    )
+    _stream_into_shard(
+        "UltraChat 200k",
+        "HuggingFaceH4/ultrachat_200k",
+        "train_sft",
+        int(remaining_budget * 0.12),
+        lambda r: (
+            f"Conversation:\nUser: {r['messages'][0]['content'].strip()}\nAssistant: {r['messages'][1]['content'].strip()}"
+            if len(r.get("messages", [])) >= 2
+            else ("", None),
+            (r["messages"][0]["content"].strip(), r["messages"][1]["content"].strip())
+            if len(r.get("messages", [])) >= 2
+            else None,
+        ),
+    )
+
+    random.seed(42)
+    random.shuffle(chunks)
+    mixed_arr = np.concatenate(chunks)
+    mixed_arr.tofile(out_train_bin)
+    print(f"Packed scaled pre-training shard: {out_train_bin} ({len(mixed_arr):,} tokens, {os.path.getsize(out_train_bin) / (1024**2):.2f} MB)")
+
+    # Build filtered causal-shifted SFT shard (>=2 unmasked assistant tokens)
+    random.shuffle(sft_pairs)
+    in_list = []
+    tgt_list = []
+    for u, a in sft_pairs:
+        if len(in_list) >= max_sft_turns:
+            break
+        if not u or not a:
+            continue
+        x, y = encode_sft_turn(tok, u, a, max_seq_len=seq_len)
+        if (y != -100).sum().item() >= 2:
+            in_list.append(x)
+            tgt_list.append(y)
+
+    sft_payload = {
+        "input_ids": torch.stack(in_list),
+        "target_ids": torch.stack(tgt_list),
+    }
+    torch.save(sft_payload, out_sft_pt)
+    print(f"Packed scaled SFT shard: {out_sft_pt} ({len(in_list):,} valid turns, {os.path.getsize(out_sft_pt) / (1024**2):.2f} MB)")
+    return out_train_bin, out_sft_pt
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="LT-1 Dataset Builder")
+    parser.add_argument("--mode", type=str, default="scaled", choices=["scaled", "legacy"])
+    parser.add_argument("--tokenizer", type=str, default="data/tokenizer_cosmo.json")
+    parser.add_argument("--out-bin", type=str, default="data/train_mix_scaled.bin")
+    parser.add_argument("--out-sft", type=str, default="data/sft_mix_scaled.pt")
+    parser.add_argument("--target-tokens", type=int, default=150_000_000)
+    parser.add_argument("--max-sft-turns", type=int, default=50000)
+    parser.add_argument("--seq-len", type=int, default=512)
+    args = parser.parse_args()
+
+    if args.mode == "scaled":
+        prepare_scaled_multidomain_datasets(
+            tokenizer_path=args.tokenizer,
+            out_train_bin=args.out_bin,
+            out_sft_pt=args.out_sft,
+            target_pretrain_tokens=args.target_tokens,
+            max_sft_turns=args.max_sft_turns,
+            seq_len=args.seq_len,
+        )
+    else:
+        prepare_multidomain_datasets(tokenizer_path=args.tokenizer, seq_len=args.seq_len)
+
+

@@ -30,6 +30,7 @@ class LT1Config:
     engram_offload_cpu: bool = False
     use_grad_checkpointing: bool = False
     use_bf16_weights: bool = False
+    use_fp32_master_weights: bool = False
 
     def __post_init__(self):
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
@@ -101,5 +102,43 @@ def lt1_1b_config(vocab_size: int = 8192) -> LT1Config:
         engram_offload_cpu=True,
         use_grad_checkpointing=True,
         use_bf16_weights=True,
+    )
+
+
+def lt1_1b_colab_config(vocab_size: int = 8192, max_seq_len: int = 512) -> LT1Config:
+    """
+    Returns 1.00B LT-1 configuration tuned for Google Colab L4 (24GB) / A100 (40GB):
+    - Keeps exact layer dimensions of lt1_1b_config for 100% checkpoint compatibility
+      with local 6GB RTX 3060 inference (export_checkpoint / pack_for_inference).
+    - Keeps Engram tables on GPU (zero PCIe transfer overhead), disables gradient
+      checkpointing for 25-30% faster backward pass, and enables FP32 master weights
+      in Muon to prevent bfloat16 rounding underflow.
+    """
+    return LT1Config(
+        vocab_size=vocab_size,
+        max_seq_len=max_seq_len,
+        d_model=896,
+        n_encoder_layers=4,
+        n_recurrent_layers=4,
+        n_coda_layers=2,
+        max_loops=4,
+        default_loops=2,
+        n_heads=14,
+        n_kv_heads=2,
+        head_dim=64,
+        moe_n_routed_experts=16,
+        moe_n_shared_experts=1,
+        moe_top_k_encoder=1,
+        moe_top_k_decoder=2,
+        moe_d_ff=1088,
+        moe_bias_lr=0.001,
+        engram_buckets=1048576,
+        engram_dim=224,
+        ncm_codebook_size=512,
+        ncm_scales=(4, 2, 1),
+        engram_offload_cpu=False,
+        use_grad_checkpointing=False,
+        use_bf16_weights=True,
+        use_fp32_master_weights=True,
     )
 

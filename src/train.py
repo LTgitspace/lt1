@@ -4,7 +4,7 @@ import time
 import math
 import numpy as np
 import torch
-from src.config import base_config, tiny_smoke_config, lt1_1b_config, LT1Config
+from src.config import base_config, tiny_smoke_config, lt1_1b_config, lt1_1b_colab_config, LT1Config
 from src.model import LT1Model
 from src.optim import TriOptimizer
 from src.tokenizer import NanoTokenizer
@@ -136,6 +136,9 @@ def run_pretrain(
     sft_steps: int = 1000,
     resume: bool = False,
     resume_path: str | None = None,
+    profile: str = "laptop",
+    no_engram_offload: bool = False,
+    max_minutes: float | None = None,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -161,13 +164,20 @@ def run_pretrain(
 
     # 2. Model & Config setup
     if scale == "1b":
-        cfg = lt1_1b_config(vocab_size=tok.vocab_size)
-        cfg.max_seq_len = seq_len
+        if profile == "colab":
+            cfg = lt1_1b_colab_config(vocab_size=tok.vocab_size, max_seq_len=seq_len)
+        else:
+            cfg = lt1_1b_config(vocab_size=tok.vocab_size)
+            cfg.max_seq_len = seq_len
+        if no_engram_offload:
+            cfg.engram_offload_cpu = False
         muon_lr = 0.015
     else:
         cfg = base_config()
         cfg.vocab_size = tok.vocab_size
         cfg.max_seq_len = seq_len
+        if no_engram_offload:
+            cfg.engram_offload_cpu = False
         muon_lr = 0.02
 
     model = LT1Model(cfg).to(device)
@@ -224,7 +234,13 @@ def run_pretrain(
             avg_loss = running_loss / (10 if step > 0 else 1)
             running_loss = 0.0
             vram_gb = torch.cuda.max_memory_allocated() / (1024 ** 3) if device == "cuda" else 0.0
-            log_message(f"Step {step+1:05d}/{steps:05d} | Loss: {avg_loss:.4f} | LR: {lr * lr_scale:.2e} | Speed: {toks_per_sec:.0f} tok/s | Peak VRAM: {vram_gb:.2f} GB | Loops: {step_loops}", log_file)
+            ld = getattr(model, "last_loss_dict", {})
+            ce_val = ld.get("ce_loss", avg_loss)
+            aux_val = 0.1 * ld.get("commit_loss", 0.0) + 0.1 * ld.get("next_concept_loss", 0.0)
+            log_message(
+                f"Step {step+1:05d}/{steps:05d} | Loss: {avg_loss:.4f} (CE: {ce_val:.4f}, Aux: {aux_val:.4f}) | LR: {lr * lr_scale:.2e} | Speed: {toks_per_sec:.0f} tok/s | Peak VRAM: {vram_gb:.2f} GB | Loops: {step_loops}",
+                log_file,
+            )
 
         # Periodic evaluation & sample generation
         if (step + 1) % eval_interval == 0:
@@ -247,6 +263,20 @@ def run_pretrain(
             torch.save(ckpt, ckpt_path)
             torch.save(ckpt, latest_path)
             log_message(f"[Checkpoint Saved] -> {ckpt_path} & {latest_path}", log_file)
+
+        if max_minutes is not None and ((time.time() - start_time) / 60.0) >= max_minutes:
+            ckpt_path = os.path.join(checkpoint_dir, f"lt1_step_{step+1}.pt")
+            latest_path = os.path.join(checkpoint_dir, "latest.pt")
+            ckpt = {
+                "step": step + 1,
+                "config": cfg,
+                "model_state_dict": model.state_dict(),
+                "step_loss": accum_loss,
+            }
+            torch.save(ckpt, ckpt_path)
+            torch.save(ckpt, latest_path)
+            log_message(f"[Time Limit Guard] Reached {max_minutes:.1f} min at step {step+1}. Saved checkpoint and transitioning.", log_file)
+            break
 
     total_time = time.time() - start_time
     log_message(f"Pre-training completed in {total_time/60:.2f} minutes!", log_file)
@@ -347,6 +377,9 @@ def main():
     parser.add_argument("--tokenizer-path", type=str, default=None)
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--log-file", type=str, default=None)
+    parser.add_argument("--profile", type=str, default="laptop", choices=["laptop", "colab"])
+    parser.add_argument("--no-engram-offload", action="store_true", default=False)
+    parser.add_argument("--max-minutes", type=float, default=None)
     args = parser.parse_args()
 
     if args.scale == "1b":
@@ -391,6 +424,9 @@ def main():
             sft_steps=args.sft_steps,
             resume=args.resume,
             resume_path=args.resume_path,
+            profile=args.profile,
+            no_engram_offload=args.no_engram_offload,
+            max_minutes=args.max_minutes,
         )
     elif args.stage == "ncm-bench":
         print("Running NCM Multiscale Benchmark...")
