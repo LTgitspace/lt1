@@ -152,14 +152,19 @@ def run_pretrain(
         log_message(f"Initial VRAM Allocated: {torch.cuda.memory_allocated() / (1024**2):.1f} MB", log_file)
 
     # 1. Ensure dataset exists
-    if not os.path.exists(data_bin) or not os.path.exists(tokenizer_path):
+    # 1. Load tokenizer (and dataset if pre-training steps remain)
+    resume_target = resume_path or (os.path.join(checkpoint_dir, "latest.pt") if resume else None)
+    skip_pretrain_data = bool(chain_sft and resume_target and os.path.exists(resume_target) and os.path.exists(tokenizer_path))
+
+    if not skip_pretrain_data and (not os.path.exists(data_bin) or not os.path.exists(tokenizer_path)):
         log_message(f"Data binary {data_bin} missing. Preparing dataset...", log_file)
         from src.data import prepare_dataset
         prepare_dataset(output_bin=data_bin, tokenizer_path=tokenizer_path, max_samples=25000, vocab_size=8192 if scale == "1b" else 4096)
 
     tok = NanoTokenizer.load(tokenizer_path)
-    dataset = MemmapDataset(data_bin, seq_len=seq_len)
-    log_message(f"Dataset: {dataset.num_tokens:,} tokens loaded from {data_bin}", log_file)
+    dataset = MemmapDataset(data_bin, seq_len=seq_len) if os.path.exists(data_bin) else None
+    if dataset is not None:
+        log_message(f"Dataset: {dataset.num_tokens:,} tokens loaded from {data_bin}", log_file)
     log_message(f"Tokenizer: vocab_size={tok.vocab_size}", log_file)
 
     # 2. Model & Config setup
@@ -300,8 +305,8 @@ def run_pretrain(
         log_message("==================================================", log_file)
         log_message(f"=== Starting Auto-Chained Conversational SFT ({sft_steps} Steps) ===", log_file)
         sft_ds = SFTDataset(sft_pt)
-        sft_lr = 1e-4
-        optimizer = TriOptimizer(model, muon_lr=muon_lr * 0.5, adamw_lr=sft_lr, sparse_lr=1e-3)
+        sft_lr = 5e-5
+        optimizer = TriOptimizer(model, muon_lr=muon_lr * 0.1, adamw_lr=sft_lr, sparse_lr=5e-4)
         model.train()
 
         sft_start = time.time()
@@ -330,7 +335,23 @@ def run_pretrain(
             if (sft_step + 1) % 250 == 0:
                 model.eval()
                 with torch.no_grad():
-                    sft_sample = generate_text(model, tok, "What does profit margin mean in finance?", max_new_tokens=30, num_loops=loops, temperature=0.5)
+                    from src.generate import sample_next_token
+                    from src.model import CEDKVCache
+                    chat_ids = [tok.user_id] + tok.encode("Hello! Who are you?") + [tok.eos_id, tok.assistant_id]
+                    cx = torch.tensor([chat_ids], dtype=torch.long, device=device)
+                    ccache = CEDKVCache(model.cfg.n_encoder_layers)
+                    cout = []
+                    with torch.amp.autocast(device_type=device, dtype=torch.bfloat16 if device == "cuda" else torch.float32):
+                        model(cx[:, :-1], num_loops=loops, kv_cache=ccache)
+                        ccurr = cx[:, -1:]
+                        for _ in range(40):
+                            clogits, _ = model(ccurr, num_loops=loops, kv_cache=ccache)
+                            cnxt = sample_next_token(clogits[0, -1, :], temperature=0.7, top_p=0.9)
+                            if cnxt == tok.eos_id:
+                                break
+                            cout.append(cnxt)
+                            ccurr = torch.tensor([[cnxt]], dtype=torch.long, device=device)
+                    sft_sample = tok.decode(cout)
                 log_message(f"--- [SFT Sample @ Step {sft_step+1}] -> {sft_sample}", log_file)
                 model.train()
 

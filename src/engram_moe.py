@@ -286,7 +286,7 @@ class DeepSeekMoE(nn.Module):
             wu = self.w_up_packed[flat_idx]   # [K, d_ff, d_model]
             wd = self.w_down_packed[flat_idx] # [K, d_model, d_ff]
 
-            x_rep = x_flat.repeat_interleave(self.top_k, dim=0).unsqueeze(-1).to(torch.bfloat16) # [K, d_model, 1]
+            x_rep = x_flat.repeat_interleave(self.top_k, dim=0).unsqueeze(-1).to(wg.dtype) # [K, d_model, 1]
             gate = F.silu(torch.bmm(wg, x_rep))
             up = torch.bmm(wu, x_rep)
             h = gate * up

@@ -318,8 +318,10 @@ def prepare_scaled_multidomain_datasets(
         token_budget: int,
         extractor,
         config_name: str | None = None,
+        sft_budget: int = 0,
+        collect_tokens: bool = True,
     ):
-        print(f"Streaming {label} ({dataset_name}) up to {token_budget:,} tokens...")
+        print(f"Streaming {label} ({dataset_name}) up to {token_budget:,} tokens, {sft_budget:,} SFT turns...")
         try:
             ds = (
                 load_dataset(dataset_name, config_name, split=split, streaming=True)
@@ -332,22 +334,26 @@ def prepare_scaled_multidomain_datasets(
 
         buf: list[int] = []
         collected = 0
+        domain_sft = 0
         for row in ds:
             text_out, pair = extractor(row)
-            if text_out:
+            if collect_tokens and text_out and collected < token_budget:
                 ids = tok.encode(text_out) + [tok.eos_id]
                 buf.extend(ids)
                 collected += len(ids)
                 if len(buf) >= 200_000:
                     _add_tokens(buf)
                     buf.clear()
-            if pair is not None and len(sft_pairs) < max_sft_turns * 2:
+            if pair is not None and domain_sft < sft_budget:
                 sft_pairs.append(pair)
-            if collected >= token_budget:
+                domain_sft += 1
+            tokens_done = (not collect_tokens) or (collected >= token_budget)
+            sft_done = domain_sft >= sft_budget
+            if tokens_done and sft_done:
                 break
         if buf:
             _add_tokens(buf)
-        print(f"  -> Collected {collected:,} tokens from {label}")
+        print(f"  -> Collected {collected:,} tokens, {domain_sft:,} SFT pairs from {label}")
 
     def _extract_magicoder(r):
         prob = (r.get("problem") or "").strip()
@@ -384,21 +390,28 @@ def prepare_scaled_multidomain_datasets(
         return f"Conversation:\nUser: {u}\nAssistant: {a}", (u, a)
 
     # Domain budgets scaled proportionally to target_pretrain_tokens
+    # Balanced SFT budgets (40% UltraChat, 25% Code, 20% Math, 15% Finance)
+    sft_pool = int(max_sft_turns * 1.15)
     remaining_budget = max(10_000_000, target_pretrain_tokens - total_tokens)
-    _stream_into_shard(
-        "FineWeb-Edu",
-        "HuggingFaceFW/fineweb-edu",
-        "train",
-        int(remaining_budget * 0.45),
-        lambda r: ((r.get("text") or "").strip(), None),
-        config_name="sample-10BT",
-    )
+    if target_pretrain_tokens > 0:
+        _stream_into_shard(
+            "FineWeb-Edu",
+            "HuggingFaceFW/fineweb-edu",
+            "train",
+            int(remaining_budget * 0.45),
+            lambda r: ((r.get("text") or "").strip(), None),
+            config_name="sample-10BT",
+            sft_budget=0,
+            collect_tokens=True,
+        )
     _stream_into_shard(
         "Code (Magicoder)",
         "ise-uiuc/Magicoder-OSS-Instruct-75K",
         "train",
         int(remaining_budget * 0.20),
         _extract_magicoder,
+        sft_budget=int(sft_pool * 0.25),
+        collect_tokens=(target_pretrain_tokens > 0),
     )
     _stream_into_shard(
         "Math (MetaMathQA)",
@@ -406,6 +419,8 @@ def prepare_scaled_multidomain_datasets(
         "train",
         int(remaining_budget * 0.15),
         _extract_metamath,
+        sft_budget=int(sft_pool * 0.20),
+        collect_tokens=(target_pretrain_tokens > 0),
     )
     _stream_into_shard(
         "Finance-Alpaca",
@@ -413,6 +428,8 @@ def prepare_scaled_multidomain_datasets(
         "train",
         int(remaining_budget * 0.08),
         _extract_finance,
+        sft_budget=int(sft_pool * 0.15),
+        collect_tokens=(target_pretrain_tokens > 0),
     )
     _stream_into_shard(
         "UltraChat 200k",
@@ -420,13 +437,16 @@ def prepare_scaled_multidomain_datasets(
         "train_sft",
         int(remaining_budget * 0.12),
         _extract_ultrachat,
+        sft_budget=int(sft_pool * 0.40),
+        collect_tokens=(target_pretrain_tokens > 0),
     )
 
     random.seed(42)
-    random.shuffle(chunks)
-    mixed_arr = np.concatenate(chunks)
-    mixed_arr.tofile(out_train_bin)
-    print(f"Packed scaled pre-training shard: {out_train_bin} ({len(mixed_arr):,} tokens, {os.path.getsize(out_train_bin) / (1024**2):.2f} MB)")
+    if target_pretrain_tokens > 0 and chunks:
+        random.shuffle(chunks)
+        mixed_arr = np.concatenate(chunks)
+        mixed_arr.tofile(out_train_bin)
+        print(f"Packed scaled pre-training shard: {out_train_bin} ({len(mixed_arr):,} tokens, {os.path.getsize(out_train_bin) / (1024**2):.2f} MB)")
 
     # Build filtered causal-shifted SFT shard (>=2 unmasked assistant tokens)
     random.shuffle(sft_pairs)
@@ -455,7 +475,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="LT-1 Dataset Builder")
-    parser.add_argument("--mode", type=str, default="scaled", choices=["scaled", "legacy"])
+    parser.add_argument("--mode", type=str, default="scaled", choices=["scaled", "sft-scaled", "legacy"])
     parser.add_argument("--tokenizer", type=str, default="data/tokenizer_cosmo.json")
     parser.add_argument("--out-bin", type=str, default="data/train_mix_scaled.bin")
     parser.add_argument("--out-sft", type=str, default="data/sft_mix_scaled.pt")
@@ -464,12 +484,12 @@ if __name__ == "__main__":
     parser.add_argument("--seq-len", type=int, default=512)
     args = parser.parse_args()
 
-    if args.mode == "scaled":
+    if args.mode in ("scaled", "sft-scaled"):
         prepare_scaled_multidomain_datasets(
             tokenizer_path=args.tokenizer,
             out_train_bin=args.out_bin,
             out_sft_pt=args.out_sft,
-            target_pretrain_tokens=args.target_tokens,
+            target_pretrain_tokens=0 if args.mode == "sft-scaled" else args.target_tokens,
             max_sft_turns=args.max_sft_turns,
             seq_len=args.seq_len,
         )

@@ -144,9 +144,14 @@ def causal_left_window_pool(
         left_pad = full_x[:, 0:1, :].repeat(1, pad_needed, 1)
         full_x = torch.cat([left_pad, full_x], dim=1)
 
-    # full_x now has length exactly t + window_size - 1
-    windows = full_x.unfold(dimension=1, size=window_size, step=1) # [b, t, d, window_size]
-    return windows.mean(dim=-1)
+    # full_x now has length >= t + window_size - 1; average over causal left window
+    if window_size == 1:
+        return full_x[:, -t:, :]
+    acc = full_x[:, window_size - 1 : window_size - 1 + t, :]
+    for offset in range(1, window_size):
+        start = window_size - 1 - offset
+        acc = acc + full_x[:, start : start + t, :]
+    return acc / float(window_size)
 
 
 class CausalMultiscaleRVQ(nn.Module):
